@@ -273,15 +273,20 @@ app.registerExtension({
         ta.addEventListener("keydown", (e) => {
           if (e.key === "Escape") { node._fb_stopEditing(); return; }
           e.stopPropagation();
+          e.stopImmediatePropagation();
         });
+        ta.addEventListener("keyup",  (e) => { e.stopPropagation(); e.stopImmediatePropagation(); });
+        ta.addEventListener("keypress", (e) => { e.stopPropagation(); e.stopImmediatePropagation(); });
         ta.addEventListener("blur", () => {
-          // small delay so click-on-save works before blur removes textarea
+          // LiteGraph steals focus constantly — fight back
           setTimeout(() => {
-            if (fb._editingTA === ta) node._fb_stopEditing();
-          }, 150);
+            if (fb._editingTA === ta && document.activeElement !== ta) {
+              ta.focus();
+            }
+          }, 20);
         });
         // Prevent canvas drag when clicking inside textarea
-        for (const ev of ["pointerdown","mousedown","pointermove","mousemove","pointerup","mouseup"])
+        for (const ev of ["pointerdown","mousedown","pointermove","mousemove","pointerup","mouseup","click","dblclick","wheel"])
           ta.addEventListener(ev, (e) => e.stopPropagation());
 
         document.body.appendChild(ta);
