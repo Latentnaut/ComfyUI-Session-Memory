@@ -226,13 +226,17 @@ app.registerExtension({
       };
 
       // ── Visible textarea overlay ────────────────────────────────────
-      // Position is computed from ctx.getTransform() captured during draw.
+      // Position computed from ctx.getTransform() captured during draw.
       nodeType.prototype._fb_stopEditing = function () {
         const fb = this._fb;
         if (fb._editingTA) {
           fb.notes[fb._editingPrompt] = fb._editingTA.value;
           fb._editingTA.remove();
           fb._editingTA = null;
+        }
+        if (fb._editingClickOut) {
+          document.removeEventListener("pointerdown", fb._editingClickOut, true);
+          fb._editingClickOut = null;
         }
         fb._editingPrompt = null;
         this.setDirtyCanvas(true);
@@ -242,7 +246,7 @@ app.registerExtension({
         this._fb_stopEditing();
         const fb = this._fb;
         const sr = fb._notesScreenRects[promptNum];
-        if (!sr) return; // no screen rect captured yet
+        if (!sr) return;
 
         const ta = document.createElement("textarea");
         ta.value = fb.notes[promptNum] || "";
@@ -267,6 +271,16 @@ app.registerExtension({
         });
 
         const node = this;
+
+        // Close when user clicks OUTSIDE the textarea (capture phase, runs first)
+        const onClickOut = (e) => {
+          if (!ta.contains(e.target)) {
+            node._fb_stopEditing();
+          }
+        };
+        document.addEventListener("pointerdown", onClickOut, true);
+        fb._editingClickOut = onClickOut;
+
         ta.addEventListener("input", () => {
           fb.notes[promptNum] = ta.value;
         });
@@ -275,15 +289,15 @@ app.registerExtension({
           e.stopPropagation();
           e.stopImmediatePropagation();
         });
-        ta.addEventListener("keyup",  (e) => { e.stopPropagation(); e.stopImmediatePropagation(); });
-        ta.addEventListener("keypress", (e) => { e.stopPropagation(); e.stopImmediatePropagation(); });
+        ta.addEventListener("keyup",   (e) => { e.stopPropagation(); e.stopImmediatePropagation(); });
+        ta.addEventListener("keypress",(e) => { e.stopPropagation(); e.stopImmediatePropagation(); });
+        // Refocus only if LiteGraph steals focus without a user click
         ta.addEventListener("blur", () => {
-          // LiteGraph steals focus constantly — fight back
           setTimeout(() => {
             if (fb._editingTA === ta && document.activeElement !== ta) {
               ta.focus();
             }
-          }, 20);
+          }, 30);
         });
         // Prevent canvas drag when clicking inside textarea
         for (const ev of ["pointerdown","mousedown","pointermove","mousemove","pointerup","mouseup","click","dblclick","wheel"])
