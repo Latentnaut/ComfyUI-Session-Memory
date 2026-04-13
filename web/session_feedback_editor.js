@@ -222,18 +222,18 @@ app.registerExtension({
         const bounds = canvas.getBoundingClientRect();
         const ds = app.canvas.ds;
 
-        // node-local → graph-offset → canvas-pixel → screen
-        const toScreen = (lx, ly) => {
-          const [px, py] = ds.convertOffsetToCanvas([
-            lx + this.pos[0],
-            ly + this.pos[1],
-          ]);
-          return [bounds.left + px, bounds.top + py];
-        };
+        // node-local → graph → canvas-pixel → screen (DPI-aware)
+        const dpr = bounds.width / canvas.width;
+        const s = ds.scale * dpr;
+        const ox = ds.offset[0];
+        const oy = ds.offset[1];
 
-        const [sx, sy] = toScreen(localRect.x, localRect.y);
-        const sw = localRect.w * ds.scale;
-        const sh = localRect.h * ds.scale;
+        const graphX = localRect.x + this.pos[0];
+        const graphY = localRect.y + this.pos[1];
+        const sx = bounds.left + (graphX + ox) * s;
+        const sy = bounds.top  + (graphY + oy) * s;
+        const sw = localRect.w * s;
+        const sh = localRect.h * s;
 
         const ta = document.createElement("textarea");
         ta.value = this._fb.notes[promptNum] || "";
@@ -580,7 +580,7 @@ app.registerExtension({
         // Header toggle
         for (const h of (fb.hitAreas.headers || [])) {
           if (!h || !hit(h)) continue;
-          fb.collapsed[h.promptNum] = fb.collapsed[h.promptNum] !== false;
+          fb.collapsed[h.promptNum] = !(fb.collapsed[h.promptNum] !== false);
           this._fb_removeTextarea();
           requestAnimationFrame(() => {
             this.setSize([this.size[0], this.computeSize()[1]]);
