@@ -62,8 +62,10 @@ app.registerExtension({
           waiting: false, saveFlash: 0,
           hitAreas: null, hoverBtn: false,
           thumbnails: {}, thumbsLoading: 0,
-          collapsed: {},          // {promptNum: bool} true=collapsed (default)
-          activeTextarea: null, _activeTaPrompt: null,
+          collapsed: {},
+          // text editing state
+          _editingPrompt: null, _editingTA: null,
+          _cursorVisible: true, _cursorBlink: null,
         };
 
         if (this.size[0] < NODE_MIN_W) this.size[0] = NODE_MIN_W;
@@ -119,7 +121,7 @@ app.registerExtension({
 
         setTimeout(() => this._fb_loadRun(), 400);
 
-        this.onRemoved = () => this._fb_removeTextarea();
+        this.onRemoved = () => this._fb_stopEditing();
       };
 
       const onWidgetChanged = nodeType.prototype.onWidgetChanged;
@@ -205,87 +207,72 @@ app.registerExtension({
           .catch(err => console.error("[Feedback] Thumbnail load error:", err));
       };
 
-      // ── Textarea overlay (correct coord transform) ──────────────────
-      nodeType.prototype._fb_removeTextarea = function () {
-        if (this._fb.activeTextarea) {
-          this._fb.activeTextarea.remove();
-          this._fb.activeTextarea = null;
-          this._fb._activeTaPrompt = null;
-          app.canvas.canvas.style.pointerEvents = "";
+      // ── Off-screen capture textarea (no coordinate math needed) ────
+      // The textarea is invisible (-9999px) and only captures keyboard.
+      // Text is rendered on the canvas, always correctly positioned.
+      nodeType.prototype._fb_stopEditing = function () {
+        const fb = this._fb;
+        if (fb._editingTA) {
+          fb.notes[fb._editingPrompt] = fb._editingTA.value;
+          fb._editingTA.remove();
+          fb._editingTA = null;
         }
+        if (fb._cursorBlink) { clearInterval(fb._cursorBlink); fb._cursorBlink = null; }
+        fb._editingPrompt = null;
+        fb._cursorVisible = true;
+        this.setDirtyCanvas(true);
       };
 
-      nodeType.prototype._fb_openTextarea = function (promptNum, localRect) {
-        this._fb_removeTextarea();
+      nodeType.prototype._fb_startEditing = function (promptNum) {
+        this._fb_stopEditing();
+        const fb = this._fb;
 
-        const canvas = app.canvas.canvas;
-        const bounds = canvas.getBoundingClientRect();
-        const ds = app.canvas.ds;
-
-        // node-local → graph → canvas-pixel → screen (DPI-aware)
-        const dpr = bounds.width / canvas.width;
-        const s = ds.scale * dpr;
-        const ox = ds.offset[0];
-        const oy = ds.offset[1];
-
-        const graphX = localRect.x + this.pos[0];
-        const graphY = localRect.y + this.pos[1];
-        const sx = bounds.left + (graphX + ox) * s;
-        const sy = bounds.top  + (graphY + oy) * s;
-        const sw = localRect.w * s;
-        const sh = localRect.h * s;
-
+        // Invisible off-screen textarea — just for keyboard input capture
         const ta = document.createElement("textarea");
-        ta.value = this._fb.notes[promptNum] || "";
-        ta.placeholder = "Add notes…";
-        Object.assign(ta.style, {
-          position: "fixed",
-          left: `${sx}px`, top: `${sy}px`,
-          width: `${sw}px`, height: `${sh}px`,
-          background: "#1e293b",
-          color: "#e0e0e0",
-          caretColor: "#7dd3fc",
-          border: "1.5px solid #2563eb",
-          borderRadius: "5px",
-          padding: "6px 8px",
-          font: "11px Inter, Arial, sans-serif",
-          resize: "none",
-          zIndex: "999999",
-          boxSizing: "border-box",
-          lineHeight: "1.5",
-          outline: "none",
-          display: "block",
-        });
-
-        // Block canvas from stealing pointer events
-        canvas.style.pointerEvents = "none";
+        ta.style.cssText = "position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;";
+        ta.value = fb.notes[promptNum] || "";
+        ta.setSelectionRange(ta.value.length, ta.value.length);
 
         const node = this;
         ta.addEventListener("input", () => {
-          node._fb.notes[promptNum] = ta.value;
-          node.setDirtyCanvas(true);
-        });
-        ta.addEventListener("blur", () => {
-          node._fb.notes[promptNum] = ta.value;
-          node._fb_removeTextarea();
+          fb.notes[promptNum] = ta.value;
           node.setDirtyCanvas(true);
         });
         ta.addEventListener("keydown", (e) => {
-          if (e.key === "Escape" || (e.key === "Enter" && e.ctrlKey)) ta.blur();
+          if (e.key === "Escape") { node._fb_stopEditing(); return; }
           e.stopPropagation();
+          // force a redraw so cursor blink resets visually after each key
+          fb._cursorVisible = true;
+          node.setDirtyCanvas(true);
         });
-        ta.addEventListener("mousedown", (e) => e.stopPropagation());
+        ta.addEventListener("blur", () => {
+          // If canvas stole focus, refocus immediately
+          setTimeout(() => {
+            if (fb._editingTA === ta && document.activeElement !== ta) {
+              ta.focus();
+            }
+          }, 30);
+        });
 
         document.body.appendChild(ta);
-        this._fb.activeTextarea = ta;
-        this._fb._activeTaPrompt = promptNum;
+        fb._editingTA = ta;
+        fb._editingPrompt = promptNum;
+
+        // Blinking cursor
+        fb._cursorVisible = true;
+        fb._cursorBlink = setInterval(() => {
+          fb._cursorVisible = !fb._cursorVisible;
+          node.setDirtyCanvas(true);
+        }, 530);
+
         ta.focus();
+        this.setDirtyCanvas(true);
       };
 
       // ── Save ────────────────────────────────────────────────────────
       nodeType.prototype._fb_saveFeedback = function () {
         if (this._fb.selectedRun === 0) return;
-        if (this._fb.activeTextarea) this._fb.activeTextarea.blur();
+        this._fb_stopEditing();
         const prompts = {};
         for (const p of this._fb.prompts) {
           const k = String(p.number);
@@ -501,30 +488,39 @@ app.registerExtension({
             ctx.fillText(RATING_LABELS[rating], sX + STAR_COUNT * sSpc + 6, sY + 12);
           }
 
-          // Notes (canvas placeholder — textarea takes over on click)
+          // Notes — canvas-rendered text + blinking cursor when active
+          const isEditing = fb._editingPrompt === pNum;
           const nY = sY + 26, nW = cW - 20;
           ctx.fillStyle = NOTES_BG;
-          ctx.strokeStyle = this._fb._activeTaPrompt === pNum ? "#2563eb" : NOTES_BORDER;
-          ctx.lineWidth = this._fb._activeTaPrompt === pNum ? 1.5 : 0.5;
+          ctx.strokeStyle = isEditing ? "#2563eb" : NOTES_BORDER;
+          ctx.lineWidth = isEditing ? 1.5 : 0.5;
           ctx.beginPath(); ctx.roundRect(cX + 10, nY, nW, NOTES_H, 5); ctx.fill(); ctx.stroke();
 
-          if (this._fb._activeTaPrompt !== pNum) {
-            ctx.font = "11px Inter, Arial, sans-serif";
-            ctx.textBaseline = "top";
-            if (notes) {
-              ctx.fillStyle = TEXT_COLOR;
-              const nLines = notes.split("\n");
-              for (let nl = 0; nl < Math.min(nLines.length, 4); nl++) {
-                let ln = nLines[nl];
-                while (ctx.measureText(ln).width > nW - 16 && ln.length > 5) ln = ln.slice(0, -4) + "…";
-                ctx.fillText(ln, cX + 16, nY + 8 + nl * 14);
-              }
-            } else {
-              ctx.fillStyle = "#475569";
-              ctx.fillText("Add notes…", cX + 14, nY + 8);
+          ctx.font = "11px Inter, Arial, sans-serif";
+          ctx.textBaseline = "top";
+          const liveNotes = isEditing && fb._editingTA ? fb._editingTA.value : notes;
+          if (liveNotes) {
+            ctx.fillStyle = TEXT_COLOR;
+            const nLines = liveNotes.split("\n");
+            for (let nl = 0; nl < Math.min(nLines.length, 4); nl++) {
+              let ln = nLines[nl];
+              while (ctx.measureText(ln).width > nW - 16 && ln.length > 5) ln = ln.slice(0, -4) + "\u2026";
+              ctx.fillText(ln, cX + 16, nY + 8 + nl * 14);
             }
-            ctx.textBaseline = "middle";
+            if (isEditing && fb._cursorVisible) {
+              const lastLine = nLines[Math.min(nLines.length - 1, 3)] || "";
+              let ln = lastLine;
+              while (ctx.measureText(ln).width > nW - 20) ln = ln.slice(0, -1);
+              ctx.fillStyle = "#7dd3fc";
+              ctx.fillRect(cX + 16 + ctx.measureText(ln).width + 1, nY + 8 + Math.min(nLines.length - 1, 3) * 14, 1.5, 12);
+            }
+          } else if (isEditing) {
+            if (fb._cursorVisible) { ctx.fillStyle = "#7dd3fc"; ctx.fillRect(cX + 16, nY + 8, 1.5, 12); }
+          } else {
+            ctx.fillStyle = "#475569";
+            ctx.fillText("Add notes\u2026", cX + 14, nY + 8);
           }
+          ctx.textBaseline = "middle";
 
           fb.hitAreas.notes[i] = { x: cX + 10, y: nY, w: nW, h: NOTES_H, promptNum: pNum };
           curY += cardH + 10;
@@ -571,17 +567,17 @@ app.registerExtension({
         if (!isClick) return false;
 
         if (hit(fb.hitAreas.leftArrow) && fb.selectedRun > 1) {
-          this._fb_removeTextarea(); this._fb_loadRun(fb.selectedRun - 1); return true;
+          this._fb_stopEditing(); this._fb_loadRun(fb.selectedRun - 1); return true;
         }
         if (hit(fb.hitAreas.rightArrow) && fb.selectedRun < fb.runCount) {
-          this._fb_removeTextarea(); this._fb_loadRun(fb.selectedRun + 1); return true;
+          this._fb_stopEditing(); this._fb_loadRun(fb.selectedRun + 1); return true;
         }
 
         // Header toggle
         for (const h of (fb.hitAreas.headers || [])) {
           if (!h || !hit(h)) continue;
           fb.collapsed[h.promptNum] = !(fb.collapsed[h.promptNum] !== false);
-          this._fb_removeTextarea();
+          this._fb_stopEditing();
           requestAnimationFrame(() => {
             this.setSize([this.size[0], this.computeSize()[1]]);
             app.graph.setDirtyCanvas(true, true);
@@ -604,7 +600,7 @@ app.registerExtension({
         // Notes → open textarea overlay
         for (const n of (fb.hitAreas.notes || [])) {
           if (!n || !hit(n)) continue;
-          this._fb_openTextarea(n.promptNum, { x: n.x, y: n.y, w: n.w, h: n.h });
+          this._fb_startEditing(n.promptNum);
           this.setDirtyCanvas(true);
           return true;
         }
@@ -613,7 +609,7 @@ app.registerExtension({
         if (hit(fb.hitAreas.saveBtn)) { this._fb_saveFeedback(); return true; }
 
         // Click elsewhere closes textarea
-        this._fb_removeTextarea();
+        this._fb_stopEditing();
         return false;
       };
     }
