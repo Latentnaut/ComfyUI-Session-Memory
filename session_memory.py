@@ -69,6 +69,10 @@ def _parse_prompts_from_entry(entry_text: str) -> list[dict]:
     """Extract prompt headers, concepts, and full text from a run entry string."""
     prompts = []
     prompt_blocks = re.split(r'(?=PROMPT \d+:)', entry_text)
+    # Markers that indicate the start of a trailing summary section (not prompt content)
+    _SUMMARY_MARKERS = re.compile(
+        r'^(SESSION\s+TALLY|TALLY|SUMMARY|SESSION_FEEDBACK|RUN\s+\d+)', re.MULTILINE
+    )
     for block in prompt_blocks:
         m = re.match(r'PROMPT (\d+):', block)
         if m:
@@ -76,14 +80,19 @@ def _parse_prompts_from_entry(entry_text: str) -> list[dict]:
             concept_match = re.search(r'concept:\s*(.+)', block)
             concept = (concept_match.group(1).strip()
                        if concept_match else f"Prompt {prompt_num}")
-            # Full block text (stripped), useful for frontend toggle display
-            full_text = block.strip()
+            # Trim trailing session-level sections from the block
+            full_text = block
+            trail = _SUMMARY_MARKERS.search(full_text)
+            if trail:
+                full_text = full_text[:trail.start()]
+            full_text = full_text.strip()
             prompts.append({
                 "number": prompt_num,
                 "concept": concept,
                 "fullText": full_text,
             })
     return prompts
+
 
 
 # ── Thumbnail helpers ──────────────────────────────────────────────────
