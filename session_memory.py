@@ -66,7 +66,7 @@ def _save(session_id: str, data: dict) -> None:
 
 
 def _parse_prompts_from_entry(entry_text: str) -> list[dict]:
-    """Extract prompt headers and concepts from a run entry string."""
+    """Extract prompt headers, concepts, and full text from a run entry string."""
     prompts = []
     prompt_blocks = re.split(r'(?=PROMPT \d+:)', entry_text)
     for block in prompt_blocks:
@@ -76,7 +76,13 @@ def _parse_prompts_from_entry(entry_text: str) -> list[dict]:
             concept_match = re.search(r'concept:\s*(.+)', block)
             concept = (concept_match.group(1).strip()
                        if concept_match else f"Prompt {prompt_num}")
-            prompts.append({"number": prompt_num, "concept": concept})
+            # Full block text (stripped), useful for frontend toggle display
+            full_text = block.strip()
+            prompts.append({
+                "number": prompt_num,
+                "concept": concept,
+                "fullText": full_text,
+            })
     return prompts
 
 
