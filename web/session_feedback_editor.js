@@ -33,6 +33,24 @@ const RATING_LABELS = {
   3: "Neutral", 4: "Good — REPLICATE", 5: "Excellent — REPLICATE",
 };
 
+// Word-wrap helper: returns array of display lines respecting maxW in canvas pixels
+function wrapText(ctx, text, maxW) {
+  const out = [];
+  for (const para of text.split("\n")) {
+    if (!para) { out.push(""); continue; }
+    const words = para.split(" ");
+    let cur = "";
+    for (const w of words) {
+      const test = cur ? cur + " " + w : w;
+      if (ctx.measureText(test).width > maxW && cur) {
+        out.push(cur); cur = w;
+      } else { cur = test; }
+    }
+    if (cur) out.push(cur);
+  }
+  return out.length ? out : [""];
+}
+
 app.registerExtension({
   name: "session.FeedbackEditor",
 
@@ -498,21 +516,20 @@ app.registerExtension({
 
           ctx.font = "11px Inter, Arial, sans-serif";
           ctx.textBaseline = "top";
+          const maxTW = nW - 16;
           const liveNotes = isEditing && fb._editingTA ? fb._editingTA.value : notes;
+          const MAX_LINES = 4;
+          const LINE_H = 14;
           if (liveNotes) {
             ctx.fillStyle = TEXT_COLOR;
-            const nLines = liveNotes.split("\n");
-            for (let nl = 0; nl < Math.min(nLines.length, 4); nl++) {
-              let ln = nLines[nl];
-              while (ctx.measureText(ln).width > nW - 16 && ln.length > 5) ln = ln.slice(0, -4) + "\u2026";
-              ctx.fillText(ln, cX + 16, nY + 8 + nl * 14);
+            const wrapped = wrapText(ctx, liveNotes, maxTW);
+            for (let nl = 0; nl < Math.min(wrapped.length, MAX_LINES); nl++) {
+              ctx.fillText(wrapped[nl], cX + 16, nY + 8 + nl * LINE_H);
             }
             if (isEditing && fb._cursorVisible) {
-              const lastLine = nLines[Math.min(nLines.length - 1, 3)] || "";
-              let ln = lastLine;
-              while (ctx.measureText(ln).width > nW - 20) ln = ln.slice(0, -1);
+              const li = Math.min(wrapped.length - 1, MAX_LINES - 1);
               ctx.fillStyle = "#7dd3fc";
-              ctx.fillRect(cX + 16 + ctx.measureText(ln).width + 1, nY + 8 + Math.min(nLines.length - 1, 3) * 14, 1.5, 12);
+              ctx.fillRect(cX + 16 + ctx.measureText(wrapped[li]).width + 1, nY + 8 + li * LINE_H, 1.5, 12);
             }
           } else if (isEditing) {
             if (fb._cursorVisible) { ctx.fillStyle = "#7dd3fc"; ctx.fillRect(cX + 16, nY + 8, 1.5, 12); }
