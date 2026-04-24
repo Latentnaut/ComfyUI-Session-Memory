@@ -7,13 +7,13 @@ const STAR_EMPTY    = "☆";
 const STAR_COUNT    = 5;
 const GOLD          = "#FFD700";
 const GREY          = "#555";
-const CARD_BG       = "#16213e";
-const CARD_BORDER   = "#0f3460";
+const CARD_BG       = "#1c1c1c";
+const CARD_BORDER   = "#333333";
 const TEXT_COLOR    = "#e0e0e0";
 const LABEL_COLOR   = "#94a3b8";
 const CONCEPT_CLR   = "#7dd3fc";
-const NOTES_BG      = "#1e293b";
-const NOTES_BORDER  = "#334155";
+const NOTES_BG      = "#222222";
+const NOTES_BORDER  = "#444444";
 const BTN_SAVE_BG   = "#2563eb";
 const BTN_SAVE_HV   = "#3b82f6";
 const BTN_WAIT_BG   = "#d97706";
@@ -64,6 +64,42 @@ app.registerExtension({
         }
       }
     });
+
+    // Global keydown to handle Delete/Backspace on selected thumbnails
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+      const tag = document.activeElement?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || document.activeElement?.isContentEditable) return;
+      
+      if (key === "delete" || key === "backspace") {
+        let targetNode = null;
+        // Find if a SessionFeedbackEditor node has selected thumbnail images
+        for (const n of app.graph._nodes) {
+          if (n.type === "SessionFeedbackEditor" || n.comfyClass === "SessionFeedbackEditor") {
+            if (n._fb && n._fb.selectedImages && n._fb.selectedImages.size > 0) {
+              // Ensure the node itself is selected in the graph to avoid accidental deletions across multiple UI panels
+              const isSel = n.is_selected || (app.canvas?.selected_nodes && app.canvas.selected_nodes[n.id] !== undefined);
+              if (isSel) {
+                targetNode = n;
+                break;
+              }
+            }
+          }
+        }
+
+        if (targetNode) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          // Move selected items to pendingDeletes queue
+          for (const path of targetNode._fb.selectedImages) {
+            targetNode._fb.pendingDeletes.add(path);
+          }
+          targetNode._fb.selectedImages.clear();
+          targetNode._fb.lastSelectedIdx = null;
+          targetNode.setDirtyCanvas(true, true);
+        }
+      }
+    }, { capture: true });
   },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -99,7 +135,7 @@ app.registerExtension({
             if (n === 0) return [W, 80];
             const cardW = W - 20;
             const availW = cardW - 20;
-            let totalH = 48;
+            let totalH = 72;
             for (let i = 0; i < n; i++) {
               const pNum = String(node._fb.prompts[i].number);
               const collapsed = node._fb.collapsed[pNum] !== false;
@@ -129,7 +165,7 @@ app.registerExtension({
               cardH += 30 + NOTES_H + 10; // stars + notes + gap
               totalH += cardH + 10;
             }
-            totalH += 56;
+            totalH += 40;
             return [W, totalH];
           },
           draw: (ctx, _n, width, posY) => node._fb_drawPanel(ctx, width, posY),
@@ -168,9 +204,36 @@ app.registerExtension({
         app.graph.setDirtyCanvas(true, true);
       };
 
-      nodeType.prototype._fb_loadRun = function (runNumber) {
+      nodeType.prototype._fb_resolveSessionId = function() {
+        // Evaluate input link if session_id is wired to another node
+        const input = this.inputs?.find(i => i.name === "session_id");
+        if (input && input.link) {
+          const l = app.graph.links[input.link];
+          if (l) {
+            const srcNode = app.graph.getNodeById(l.origin_id);
+            if (srcNode) {
+              if (
+                srcNode.type === "SessionIDSelector" || srcNode.comfyClass === "SessionIDSelector" ||
+                srcNode.type === "SessionMemoryReader" || srcNode.comfyClass === "SessionMemoryReader"
+              ) {
+                const ex = srcNode.widgets?.find(w => w.name === "existing_session")?.value;
+                const nw = srcNode.widgets?.find(w => w.name === "new_session_name")?.value;
+                if (ex === "[CREATE NEW]") return nw?.trim() || "default";
+                return ex || "default";
+              }
+              if (srcNode.type === "PrimitiveNode" || (srcNode.type && srcNode.type.includes("String"))) {
+                return srcNode.widgets?.[0]?.value || "default";
+              }
+            }
+          }
+        }
+        // Fallback to local widget
         const w = this.widgets?.find(w => w.name === "session_id");
-        const sid = w?.value || "default";
+        return w?.value || this._fb.sessionId || "default";
+      };
+
+      nodeType.prototype._fb_loadRun = function (runNumber) {
+        const sid = this._fb_resolveSessionId();
         this._fb.sessionId = sid;
         const rp = runNumber ? `&run_number=${runNumber}` : "";
         fetch(`/session_feedback/load?session_id=${encodeURIComponent(sid)}${rp}`)
@@ -201,9 +264,15 @@ app.registerExtension({
           .then(data => {
             this._fb.thumbnails = {};
             this._fb.thumbsLoading = 0;
+            this._fb.selectedImages = new Set();
+            this._fb.pendingDeletes = new Set();
+            this._fb.lastSelectedIdx = -1;
+            let globalIdx = 0;
             for (const [pNum, urls] of Object.entries(data)) {
               this._fb.thumbnails[pNum] = urls.map(url => {
                 const img = new Image();
+                img._urlPath = url.split("?path=")[1] || url;
+                img._globalIdx = globalIdx++;
                 this._fb.thumbsLoading++;
                 img.onload = () => {
                   this._fb.thumbsLoading--;
@@ -218,7 +287,12 @@ app.registerExtension({
                 img.src = url;
                 return img;
               });
+              
+              if (!this._fb.prompts.find((p) => String(p.number) === pNum)) {
+                this._fb.prompts.push({ number: parseInt(pNum, 10), concept: `Result ${pNum}`, fullText: "" });
+              }
             }
+            this._fb.prompts.sort((a, b) => a.number - b.number);
             this.setSize([this.size[0], this.computeSize()[1]]);
             this.setDirtyCanvas(true);
           })
@@ -255,7 +329,7 @@ app.registerExtension({
           position: "fixed",
           left: `${sr.x}px`, top: `${sr.y}px`,
           width: `${sr.w}px`, height: `${sr.h}px`,
-          background: "#1e293b",
+          background: "#222222",
           color: "#e0e0e0",
           caretColor: "#7dd3fc",
           border: "1.5px solid #2563eb",
@@ -283,6 +357,7 @@ app.registerExtension({
 
         ta.addEventListener("input", () => {
           fb.notes[promptNum] = ta.value;
+          node._fb_autosave();
         });
         ta.addEventListener("keydown", (e) => {
           if (e.key === "Escape") { node._fb_stopEditing(); return; }
@@ -310,31 +385,84 @@ app.registerExtension({
         ta.setSelectionRange(ta.value.length, ta.value.length);
       };
 
-      // ── Save ────────────────────────────────────────────────────────
-      nodeType.prototype._fb_saveFeedback = function () {
+      // ── Save / Autosave ─────────────────────────────────────────────
+      nodeType.prototype._fb_autosave = function () {
+        if (this._autosaveTimer) clearTimeout(this._autosaveTimer);
+        this._autosaveTimer = setTimeout(() => {
+          this._fb_saveFeedback(false);
+        }, 800);
+      };
+
+      nodeType.prototype._fb_saveFeedback = function (includeDeletions = true) {
         if (this._fb.selectedRun === 0) return;
-        this._fb_stopEditing();
+        if (includeDeletions) this._fb_stopEditing();
+        
         const prompts = {};
         for (const p of this._fb.prompts) {
           const k = String(p.number);
           prompts[k] = { rating: this._fb.ratings[k] || 0, notes: this._fb.notes[k] || "" };
         }
+        
         fetch("/session_feedback/save", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id: this._fb.sessionId, run_number: this._fb.selectedRun, prompts }),
+          body: JSON.stringify({ 
+             session_id: this._fb.sessionId, 
+             run_number: this._fb.selectedRun, 
+             prompts,
+             deleted_thumbs: includeDeletions ? Array.from(this._fb.pendingDeletes || []) : []
+          }),
         })
           .then(() => {
             this._fb.saveFlash = Date.now();
+            if (includeDeletions) {
+              if (this._fb.pendingDeletes) this._fb.pendingDeletes.clear();
+              if (this._fb.selectedImages) this._fb.selectedImages.clear();
+            }
             this.setDirtyCanvas(true);
-            if (this._fb.waiting) {
+            
+            if (this._fb.waiting && includeDeletions) {
               fetch("/session_feedback/resume", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ node_id: String(this.id) }),
               }).then(() => { this._fb.waiting = false; this.setDirtyCanvas(true); });
             }
+            
+            if (includeDeletions) this._fb_loadThumbnails();
           });
+      };
+
+      nodeType.prototype._fb_resumeWorkflow = function () {
+        if (!this._fb.waiting) return;
+        fetch("/session_feedback/resume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ node_id: String(this.id) }),
+        }).then(() => { this._fb.waiting = false; this.setDirtyCanvas(true); });
+      };
+
+      nodeType.prototype._fb_deleteRun = function () {
+        if (this._fb.selectedRun === 0) return;
+        this._fb_stopEditing();
+        fetch("/session_feedback/delete_run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: this._fb.sessionId, run_number: this._fb.selectedRun }),
+        })
+          .then(() => {
+            // Unblock workflow if waiting
+            if (this._fb.waiting) {
+              fetch("/session_feedback/resume", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ node_id: String(this.id) }),
+              }).then(() => { this._fb.waiting = false; });
+            }
+            this._fb.selectedRun = 0;
+            this._fb_loadRun(0);
+          })
+          .catch(err => console.error("[Feedback] Delete error:", err));
       };
 
       // ── Draw panel ──────────────────────────────────────────────────
@@ -347,10 +475,19 @@ app.registerExtension({
         ctx.save();
 
         if (fb.runCount === 0) {
+          ctx.fillStyle = LABEL_COLOR;
+          ctx.font = "bold 12px Inter, Arial, sans-serif";
+          ctx.textBaseline = "middle";
+          ctx.fillText("Session:", pad, curY + 14);
+
+          ctx.fillStyle = "#fff";
+          ctx.font = "bold 13px Inter, Arial, sans-serif";
+          ctx.fillText(fb.sessionId || "default", pad + 55, curY + 14);
+
           ctx.fillStyle = GREY;
           ctx.font = "italic 12px Inter, Arial, sans-serif";
-          ctx.textBaseline = "middle";
-          ctx.fillText("No runs in this session.", pad, curY + 30);
+          ctx.fillText("No runs in this session.", pad, curY + 40);
+          
           ctx.restore();
           return;
         }
@@ -364,18 +501,29 @@ app.registerExtension({
           ctx.fillStyle = BTN_WAIT_BG;
           ctx.font = "bold 11px Inter, Arial, sans-serif";
           ctx.textBaseline = "middle";
-          ctx.fillText("⏸  Workflow paused — add feedback and click Save", pad + 6, curY + 13);
+          ctx.fillText("⏸  Workflow paused — add feedback and click Resume Workflow", pad + 6, curY + 13);
           ctx.globalAlpha = 1;
           curY += barH + 4;
           requestAnimationFrame(() => this.setDirtyCanvas(true));
         }
 
-        // Run navigator
-        fb.hitAreas = { leftArrow: null, rightArrow: null, stars: [], headers: [], notes: [], saveBtn: null };
+        fb.hitAreas = { leftArrow: null, rightArrow: null, stars: [], headers: [], notes: [], saveBtn: null, thumbnails: [], trashBtn: null, undoBtn: null, confirmBtn: null };
 
+        // --- ROW 1: Session Info & Load/Nuke Buttons ---
         ctx.fillStyle = LABEL_COLOR;
         ctx.font = "bold 12px Inter, Arial, sans-serif";
         ctx.textBaseline = "middle";
+        ctx.fillText("Session:", pad, curY + 14);
+
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 13px Inter, Arial, sans-serif";
+        ctx.fillText(fb.sessionId || "default", pad + 55, curY + 14);
+
+        curY += 28; // move to row 2
+
+        // --- ROW 2: Run Info & Delete Button ---
+        ctx.fillStyle = LABEL_COLOR;
+        ctx.font = "bold 12px Inter, Arial, sans-serif";
         ctx.fillText("Run:", pad, curY + 14);
 
         const leftX = pad + 35, labelX = leftX + 26, rightX = labelX + 80;
@@ -392,6 +540,79 @@ app.registerExtension({
         ctx.font = "bold 16px Inter, Arial, sans-serif";
         ctx.fillText("▶", rightX + 2, curY + 14);
         fb.hitAreas.rightArrow = { x: rightX, y: curY + 4, w: 24, h: 22 };
+
+        // Draw "Delete" (run) right-aligned with the right arrow for tidiness, or just fixed offset
+        const delX = rightX + 30;
+        const borderColor = fb.hoverDelete ? "#fca5a5" : "#f87171"; // lighter red/salmon
+        const bgColor = fb.hoverDelete ? "#451a1a" : "#2c1414";     // dark red tint
+
+        ctx.fillStyle = bgColor;
+        ctx.beginPath(); 
+        ctx.roundRect(delX, curY + 3, 100, 22, 4); 
+        ctx.fill();
+        
+        ctx.strokeStyle = borderColor;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        ctx.fillStyle = borderColor;
+        ctx.font = "12px Inter, Arial, sans-serif";
+        ctx.fillText("✕  Delete Run", delX + 10, curY + 14);
+        fb.hitAreas.deleteBtn = { x: delX, y: curY + 3, w: 100, h: 22 };
+
+        let dynX = delX + 110;
+        
+        // Trash Button
+        if (fb.selectedImages && fb.selectedImages.size > 0) {
+          const trashBorder = fb.hoverTrash ? "#93c5fd" : "#3b82f6";
+          const trashBg = fb.hoverTrash ? "#1e3a8a" : "#1e40af";
+          const txt = `🗑 Delete ${fb.selectedImages.size}`;
+          const textW = ctx.measureText(txt).width + 24;
+
+          ctx.fillStyle = trashBg;
+          ctx.beginPath(); ctx.roundRect(dynX, curY + 3, textW, 22, 4); ctx.fill();
+          ctx.strokeStyle = trashBorder; ctx.lineWidth = 1; ctx.stroke();
+          
+          ctx.fillStyle = trashBorder;
+          ctx.font = "12px Inter, Arial, sans-serif";
+          ctx.fillText(txt, dynX + 10, curY + 14);
+          fb.hitAreas.trashBtn = { x: dynX, y: curY + 3, w: textW, h: 22 };
+          dynX += textW + 10;
+        }
+
+        // Undo & Confirm Deletion
+        if (fb.pendingDeletes && fb.pendingDeletes.size > 0) {
+          const undoBorder = fb.hoverUndo ? "#fcd34d" : "#f59e0b";
+          const undoBg = fb.hoverUndo ? "#78350f" : "#451a03";
+          const uTxt = `↩️ Undo (${fb.pendingDeletes.size})`;
+          const uTextW = ctx.measureText(uTxt).width + 24;
+
+          ctx.fillStyle = undoBg;
+          ctx.beginPath(); ctx.roundRect(dynX, curY + 3, uTextW, 22, 4); ctx.fill();
+          ctx.strokeStyle = undoBorder; ctx.lineWidth = 1; ctx.stroke();
+          
+          ctx.fillStyle = undoBorder;
+          ctx.font = "12px Inter, Arial, sans-serif";
+          ctx.fillText(uTxt, dynX + 10, curY + 14);
+          fb.hitAreas.undoBtn = { x: dynX, y: curY + 3, w: uTextW, h: 22 };
+          dynX += uTextW + 10;
+          
+          const confirmBorder = fb.hoverConfirm ? "#fca5a5" : "#ef4444";
+          const confirmBg = fb.hoverConfirm ? "#7f1d1d" : "#450a0a";
+          const cTxt = `⚠️ Confirm Deletion`;
+          const cTextW = ctx.measureText(cTxt).width + 24;
+
+          ctx.fillStyle = confirmBg;
+          ctx.beginPath(); ctx.roundRect(dynX, curY + 3, cTextW, 22, 4); ctx.fill();
+          ctx.strokeStyle = confirmBorder; ctx.lineWidth = 1; ctx.stroke();
+          
+          ctx.fillStyle = confirmBorder;
+          ctx.font = "bold 12px Inter, Arial, sans-serif";
+          ctx.fillText(cTxt, dynX + 10, curY + 14);
+          fb.hitAreas.confirmBtn = { x: dynX, y: curY + 3, w: cTextW, h: 22 };
+          dynX += cTextW + 10;
+        }
+
         curY += 38;
 
         // Prompt cards
@@ -400,7 +621,7 @@ app.registerExtension({
           const pNum = String(prompt.number);
           const rating = fb.ratings[pNum] || 0;
           const notes = fb.notes[pNum] || "";
-          const thumbs = fb.thumbnails[pNum] || [];
+          const thumbs = (fb.thumbnails[pNum] || []).filter(img => !fb.pendingDeletes.has(img._urlPath));
           const collapsed = fb.collapsed[pNum] !== false;
 
           const cX = pad - 4;
@@ -502,8 +723,22 @@ app.registerExtension({
                 ctx.beginPath(); ctx.roundRect(tX, tY, tw, THUMB_MAX_H, 5); ctx.clip();
                 ctx.drawImage(img, tX, tY, tw, THUMB_MAX_H);
                 ctx.restore();
-                ctx.strokeStyle = "#334155"; ctx.lineWidth = 1;
+
+                const isSelected = fb.selectedImages && fb.selectedImages.has(img._urlPath);
+                
+                if (isSelected) {
+                   ctx.fillStyle = "rgba(59,130,246,0.25)";
+                   ctx.beginPath(); ctx.roundRect(tX, tY, tw, THUMB_MAX_H, 5); ctx.fill();
+                   ctx.strokeStyle = "#60a5fa";
+                   ctx.lineWidth = 2.5;
+                } else {
+                   ctx.strokeStyle = "#334155"; 
+                   ctx.lineWidth = 1;
+                }
+
                 ctx.beginPath(); ctx.roundRect(tX, tY, tw, THUMB_MAX_H, 5); ctx.stroke();
+                
+                fb.hitAreas.thumbnails.push({ x: tX, y: tY, w: tw, h: THUMB_MAX_H, path: img._urlPath, globalIdx: img._globalIdx });
                 tX += tw + THUMB_GAP;
               }
               tY += THUMB_MAX_H + THUMB_GAP;
@@ -576,25 +811,34 @@ app.registerExtension({
           curY += cardH + 10;
         }
 
-        // Save button
-        const btnW = inW + 8, btnH = 34, btnX = pad - 4, btnY = curY + 2;
+        // Bottom button: Only "Resume Option" if blocking, else just a tiny flash text if just saved
+        const btnX = pad - 4, btnY = curY + 2, btnW = inW + 8;
         const flash = (Date.now() - fb.saveFlash) < 1500;
-        const btnBg = flash ? BTN_DONE_BG : (fb.waiting ? (fb.hoverBtn ? BTN_WAIT_HV : BTN_WAIT_BG) : (fb.hoverBtn ? BTN_SAVE_HV : BTN_SAVE_BG));
-        const btnText = flash ? "✅  Saved" : (fb.waiting ? "💾  Save & Continue  ▶" : "💾  Save Feedback");
 
-        ctx.shadowColor = "rgba(0,0,0,0.3)"; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
-        ctx.fillStyle = btnBg;
-        ctx.beginPath(); ctx.roundRect(btnX, btnY, btnW, btnH, 8); ctx.fill();
-        ctx.shadowColor = "transparent"; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+        if (fb.waiting) {
+          const btnH = 34;
+          const btnBg = fb.hoverBtn ? BTN_WAIT_HV : BTN_WAIT_BG;
+          const btnText = "▶  Resume Workflow";
 
-        ctx.fillStyle = "#fff";
-        ctx.font = "bold 13px Inter, Arial, sans-serif";
-        ctx.textBaseline = "middle";
-        const tw = ctx.measureText(btnText).width;
-        ctx.fillText(btnText, btnX + (btnW - tw) / 2, btnY + btnH / 2);
-        fb.hitAreas.saveBtn = { x: btnX, y: btnY, w: btnW, h: btnH };
+          ctx.shadowColor = "rgba(0,0,0,0.3)"; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
+          ctx.fillStyle = btnBg;
+          ctx.beginPath(); ctx.roundRect(btnX, btnY, btnW, btnH, 8); ctx.fill();
+          ctx.shadowColor = "transparent"; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
 
-        if (flash) requestAnimationFrame(() => this.setDirtyCanvas(true));
+          ctx.fillStyle = "#fff";
+          ctx.font = "bold 13px Inter, Arial, sans-serif";
+          ctx.textBaseline = "middle";
+          const tw = ctx.measureText(btnText).width;
+          ctx.fillText(btnText, btnX + (btnW - tw) / 2, btnY + btnH / 2);
+          fb.hitAreas.saveBtn = { x: btnX, y: btnY, w: btnW, h: btnH };
+        } else if (flash) {
+          ctx.fillStyle = "#4ade80";
+          ctx.font = "italic 11px Inter, Arial, sans-serif";
+          ctx.textBaseline = "middle";
+          ctx.fillText("✅ Autosaved", btnX + 4, btnY + 12);
+          requestAnimationFrame(() => this.setDirtyCanvas(true));
+        }
+
         ctx.restore();
       };
 
@@ -606,9 +850,14 @@ app.registerExtension({
         const hit = (r) => r && mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
 
         if (event.type === "pointermove" || event.type === "mousemove") {
-          const was = fb.hoverBtn;
+          const wasH = fb.hoverBtn, wasD = fb.hoverDelete;
+          const wasT = fb.hoverTrash, wasU = fb.hoverUndo, wasC = fb.hoverConfirm;
           fb.hoverBtn = hit(fb.hitAreas.saveBtn);
-          if (was !== fb.hoverBtn) this.setDirtyCanvas(true);
+          fb.hoverDelete = hit(fb.hitAreas.deleteBtn);
+          fb.hoverTrash = hit(fb.hitAreas.trashBtn);
+          fb.hoverUndo = hit(fb.hitAreas.undoBtn);
+          fb.hoverConfirm = hit(fb.hitAreas.confirmBtn);
+          if (wasH !== fb.hoverBtn || wasD !== fb.hoverDelete || wasT !== fb.hoverTrash || wasU !== fb.hoverUndo || wasC !== fb.hoverConfirm) this.setDirtyCanvas(true);
           return false;
         }
 
@@ -616,11 +865,72 @@ app.registerExtension({
                         event.type === (LiteGraph.pointerevents_method + "down");
         if (!isClick) return false;
 
+
+
         if (hit(fb.hitAreas.leftArrow) && fb.selectedRun > 1) {
           this._fb_stopEditing(); this._fb_loadRun(fb.selectedRun - 1); return true;
         }
         if (hit(fb.hitAreas.rightArrow) && fb.selectedRun < fb.runCount) {
           this._fb_stopEditing(); this._fb_loadRun(fb.selectedRun + 1); return true;
+        }
+
+        if (hit(fb.hitAreas.deleteBtn) && fb.selectedRun > 0) {
+          this._fb_stopEditing();
+          if (window.confirm("🗑️ Completely delete Run " + fb.selectedRun + "?\n\nThis will remove it from the session history along with all its thumbnails. This action cannot be undone.")) {
+            this._fb_deleteRun();
+          }
+          return true;
+        }
+
+        if (hit(fb.hitAreas.trashBtn)) {
+          for (const path of fb.selectedImages) fb.pendingDeletes.add(path);
+          fb.selectedImages.clear();
+          fb.lastSelectedIdx = -1;
+          this._fb_stopEditing();
+          requestAnimationFrame(() => {
+            this.setSize([this.size[0], this.computeSize()[1]]);
+            app.graph.setDirtyCanvas(true, true);
+          });
+          return true;
+        }
+
+        if (hit(fb.hitAreas.undoBtn)) {
+          fb.pendingDeletes.clear();
+          this._fb_stopEditing();
+          requestAnimationFrame(() => {
+            this.setSize([this.size[0], this.computeSize()[1]]);
+            app.graph.setDirtyCanvas(true, true);
+          });
+          return true;
+        }
+
+        // Thumbnails selection
+        for (const t of (fb.hitAreas.thumbnails || [])) {
+          if (!hit(t)) continue;
+          
+          this._fb_stopEditing();
+          
+          if (event.shiftKey && fb.lastSelectedIdx >= 0) {
+              const start = Math.min(fb.lastSelectedIdx, t.globalIdx);
+              const end = Math.max(fb.lastSelectedIdx, t.globalIdx);
+              for (const ht of fb.hitAreas.thumbnails) {
+                  if (ht.globalIdx >= start && ht.globalIdx <= end) {
+                      if (!fb.pendingDeletes.has(ht.path)) {
+                          fb.selectedImages.add(ht.path);
+                      }
+                  }
+              }
+          } else {
+              // Additive Selection default
+              if (fb.selectedImages.has(t.path)) {
+                  fb.selectedImages.delete(t.path);
+              } else {
+                  fb.selectedImages.add(t.path);
+                  fb.lastSelectedIdx = t.globalIdx;
+              }
+          }
+          this.setDirtyCanvas(true);
+          return true;
         }
 
         // Header toggle
@@ -642,6 +952,7 @@ app.registerExtension({
             if (!s || !hit(s)) continue;
             const nr = s.starIdx + 1;
             fb.ratings[s.promptNum] = fb.ratings[s.promptNum] === nr ? 0 : nr;
+            this._fb_autosave();
             this.setDirtyCanvas(true);
             return true;
           }
@@ -655,8 +966,15 @@ app.registerExtension({
           return true;
         }
 
-        // Save
-        if (hit(fb.hitAreas.saveBtn)) { this._fb_saveFeedback(); return true; }
+        // Confirm explicit Deletions
+        if (hit(fb.hitAreas.confirmBtn)) { this._fb_saveFeedback(true); return true; }
+
+        // Resume workflow explicit button (when paused/blocking)
+        if (hit(fb.hitAreas.saveBtn) && fb.waiting) { 
+          this._fb_saveFeedback(false); 
+          this._fb_resumeWorkflow();
+          return true; 
+        }
 
         // Click elsewhere closes textarea
         this._fb_stopEditing();
@@ -664,18 +982,116 @@ app.registerExtension({
       };
     }
 
-    // ── Session Memory Reader — reset confirmation ────────────────────
-    if (nodeData.name === "SessionMemoryReader") {
-      const orig = nodeType.prototype.onWidgetChanged;
-      nodeType.prototype.onWidgetChanged = function (widget) {
-        if (widget?.name === "reset_session" && widget.value === true) {
-          const ok = window.confirm(
-            "⚠️ Reset session?\n\nALL data will be permanently deleted:\n" +
-            "• Run history\n• Feedback & ratings\n• All thumbnail images\n\nThis action cannot be undone."
-          );
-          if (!ok) { widget.value = false; this.setDirtyCanvas(true); return; }
-        }
-        if (orig) orig.apply(this, arguments);
+    // ── Session Memory Reader & Selector — dynamic load and custom buttons ──
+    if (nodeData.name === "SessionMemoryReader" || nodeData.name === "SessionIDSelector") {
+      const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        if (origOnNodeCreated) origOnNodeCreated.apply(this, arguments);
+
+        // Native Buttons for Rename and Nuke
+        this.addWidget("button", "✏️ Rename Session", "rename_session", () => {
+          const w = this.widgets.find(x => x.name === "existing_session");
+          const oldName = w ? w.value : null;
+
+          if (!oldName || oldName === "[CREATE NEW]") return alert("Please select an active session to rename.");
+          
+          const newName = window.prompt("Enter new session name:", oldName);
+          if (!newName || newName === oldName || newName.trim() === "") return;
+
+          fetch("/session_feedback/rename_session", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ old_session_id: oldName, new_session_id: newName.trim() })
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.error) return alert("Error renaming: " + data.error);
+            
+            // Rename in all dropdowns
+            app.graph._nodes.forEach(n => {
+              if (n.type === "SessionMemoryReader" || n.comfyClass === "SessionMemoryReader" ||
+                  n.type === "SessionIDSelector" || n.comfyClass === "SessionIDSelector") {
+                const combo = n.widgets?.find(x => x.name === "existing_session");
+                if (combo && combo.options && combo.options.values) {
+                  const idx = combo.options.values.indexOf(oldName);
+                  if (idx !== -1) {
+                    combo.options.values[idx] = newName.trim();
+                  } else {
+                    combo.options.values.push(newName.trim()); // Fallback if missing
+                  }
+                  if (combo.value === oldName) combo.value = newName.trim();
+                }
+              }
+            });
+            // Refresh all Feedback Editor nodes
+            app.graph._nodes.forEach(n => {
+              if (n.type === "SessionFeedbackEditor" || n.comfyClass === "SessionFeedbackEditor") {
+                 if (n._fb_loadRun) n._fb_loadRun(0);
+              }
+            });
+          }).catch(err => console.error("[Feedback] Rename session error:", err));
+        });
+
+        this.addWidget("button", "☢️ Nuke Session", "nuke_session", () => {
+          const w = this.widgets.find(x => x.name === "existing_session");
+          const sessionName = w ? w.value : null;
+          
+          if (!sessionName || sessionName === "[CREATE NEW]") return alert("Please select a session to Nuke.");
+
+          if (window.confirm(`⚠️ WARNING ⚠️\n\nYou are about to DELETE the entire session '${sessionName}'.\nThis removes all runs, prompts, and thumbnails permanently.\n\nAre you sure you want to proceed?`)) {
+            fetch("/session_feedback/delete_session", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ session_id: sessionName })
+            }).then(() => {
+              // Remove from all dropdowns
+              app.graph._nodes.forEach(n => {
+                if (n.type === "SessionMemoryReader" || n.comfyClass === "SessionMemoryReader" ||
+                    n.type === "SessionIDSelector" || n.comfyClass === "SessionIDSelector") {
+                  const combo = n.widgets?.find(x => x.name === "existing_session");
+                  if (combo && combo.options && combo.options.values) {
+                    combo.options.values = combo.options.values.filter(v => v !== sessionName);
+                    if (combo.value === sessionName) combo.value = combo.options.values[0] || "[CREATE NEW]";
+                  }
+                }
+              });
+              // Refresh all Feedback Editor nodes
+              app.graph._nodes.forEach(n => {
+                if (n.type === "SessionFeedbackEditor" || n.comfyClass === "SessionFeedbackEditor") {
+                   if (n._fb_loadRun) n._fb_loadRun(0);
+                }
+              });
+            }).catch(err => console.error("[Feedback] Delete session error:", err));
+          }
+        });
+
+        // We wrap this in a small timeout to let ComfyUI finish building native widgets
+        setTimeout(() => {
+          if (!this.widgets) return;
+          // Filter out the old reset_session widget if it still exists from cached versions
+          const rsIdx = this.widgets.findIndex(w => w.name === "reset_session");
+          if (rsIdx !== -1) this.widgets.splice(rsIdx, 1);
+
+          for (const w of this.widgets) {
+            const origCb = w.callback;
+            w.callback = function (v, canvas, node, pos, event) {
+              const res = origCb ? origCb.apply(this, arguments) : v;
+
+              if (w.name === "existing_session" || w.name === "new_session_name") {
+                // Find node by referencing 'this' from the outer scope, or 'node' argument
+                const parentNode = node || app.graph.getNodeById(this?.id) || {};
+                clearTimeout(parentNode._fb_loadTimeout);
+                parentNode._fb_loadTimeout = setTimeout(() => {
+                  app.graph._nodes.forEach(n => {
+                    if (n.type === "SessionFeedbackEditor" || n.comfyClass === "SessionFeedbackEditor") {
+                      if (n._fb_loadRun) n._fb_loadRun(0);
+                    }
+                  });
+                }, 300);
+              }
+
+              return res;
+            };
+          }
+        }, 100);
       };
     }
   },

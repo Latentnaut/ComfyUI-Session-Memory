@@ -91,6 +91,20 @@ def _parse_prompts_from_entry(entry_text: str) -> list[dict]:
                 "concept": concept,
                 "fullText": full_text,
             })
+            
+    # Fallback: if no PROMPT X markers, treat the whole entry as Prompt 1
+    if not prompts and entry_text.strip():
+        full_text = entry_text.strip()
+        trail = _SUMMARY_MARKERS.search(full_text)
+        if trail:
+            full_text = full_text[:trail.start()]
+        
+        prompts.append({
+            "number": 1,
+            "concept": "Result",
+            "fullText": full_text.strip()
+        })
+        
     return prompts
 
 
@@ -159,6 +173,9 @@ def _save_thumbnails(session_id, run_number, num_prompts, batch_count,
 
         img_np = (img_t.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         pil_img = PILImage.fromarray(img_np)
+
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
 
         if (new_h, new_w) != (h, w):
             pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
@@ -309,6 +326,24 @@ async def _api_save_feedback(request):
     session["feedback"] = feedback
     _save(session_id, session)
 
+    deleted_thumbs = body.get("deleted_thumbs", [])
+    if deleted_thumbs:
+        del_count = 0
+        for thumb_rel in deleted_thumbs:
+            # Reconstruct absolute paths safely
+            safe_rel = thumb_rel.lstrip("/\\")
+            if ".." in safe_rel: 
+                continue
+            abs_path = os.path.join(SESSIONS_DIR, safe_rel)
+            if os.path.isfile(abs_path):
+                try:
+                    os.remove(abs_path)
+                    del_count += 1
+                except OSError as e:
+                    logger.warning(f"[Session Feedback] Could not delete thumb {thumb_rel}: {e}")
+        if del_count > 0:
+            logger.info(f"[Session Feedback] Permanently deleted {del_count} selected thumbnails.")
+
     logger.info(
         f"[Session Feedback] Saved feedback for Run {run_number} "
         f"in session '{session_id}' ({len(prompts_fb)} prompts)."
@@ -332,6 +367,146 @@ async def _api_resume_feedback(request):
         return web.json_response({"status": "resumed"})
 
     return web.json_response({"status": "not_found"})
+
+
+@PromptServer.instance.routes.post("/session_feedback/delete_run")
+async def _api_delete_run(request):
+    """Delete a specific run and its thumbnails."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    session_id = body.get("session_id", "default")
+    run_number = str(body.get("run_number", ""))
+
+    if not run_number:
+        return web.json_response({"error": "run_number required"}, status=400)
+
+    session = _load(session_id)
+    
+    del_run_int = int(run_number)
+    entries = session.get("entries", [])
+    run_count = session.get("run_count", len(entries))
+    idx = del_run_int - 1
+
+    # 1. Update entries
+    if 0 <= idx < len(entries):
+        entries.pop(idx)
+    session["run_count"] = max(0, run_count - 1)
+    session["entries"] = entries
+
+    # 2. Update feedback keys
+    feedback = session.get("feedback", {})
+    new_feedback = {}
+    for k_str, v in feedback.items():
+        try:
+            k_int = int(k_str)
+            if k_int < del_run_int:
+                new_feedback[str(k_int)] = v
+            elif k_int > del_run_int:
+                new_feedback[str(k_int - 1)] = v
+        except ValueError:
+            pass
+    session["feedback"] = new_feedback
+    _save(session_id, session)
+
+    # 3. Delete the target thumbnail folder
+    safe_sid = _safe_id(session_id)
+    del_dir = os.path.join(SESSIONS_DIR, safe_sid, f"run_{del_run_int}")
+    if os.path.isdir(del_dir):
+        shutil.rmtree(del_dir, ignore_errors=True)
+
+    # 4. Shift subsequent thumbnail folders down by 1
+    for k in range(del_run_int + 1, run_count + 1):
+        old_dir = os.path.join(SESSIONS_DIR, safe_sid, f"run_{k}")
+        new_dir = os.path.join(SESSIONS_DIR, safe_sid, f"run_{k-1}")
+        if os.path.isdir(old_dir):
+            try:
+                os.rename(old_dir, new_dir)
+            except OSError as e:
+                logger.error(f"[Session Feedback] Rename failed: {e}")
+
+    logger.info(f"[Session Feedback] Deleted Run {del_run_int} in session '{session_id}' and shifted remaining runs.")
+    return web.json_response({"status": "deleted"})
+
+
+@PromptServer.instance.routes.post("/session_feedback/delete_session")
+async def _api_delete_session(request):
+    """Completely delete a session JSON and all its image assets."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    session_id = body.get("session_id", "default")
+    if not session_id:
+        return web.json_response({"error": "Session ID required"}, status=400)
+
+    safe_sid = _safe_id(session_id)
+    
+    # 1. Delete the JSON file
+    json_path = os.path.join(SESSIONS_DIR, f"{safe_sid}.json")
+    if os.path.isfile(json_path):
+        os.remove(json_path)
+
+    # 2. Delete the entire thumbnails folder
+    img_dir = os.path.join(SESSIONS_DIR, safe_sid)
+    if os.path.isdir(img_dir):
+        shutil.rmtree(img_dir, ignore_errors=True)
+
+    logger.warning(f"[Session Feedback] NUKED session '{session_id}' entirely.")
+    return web.json_response({"status": "deleted"})
+
+
+@PromptServer.instance.routes.post("/session_feedback/rename_session")
+async def _api_rename_session(request):
+    """Rename a session JSON and its thumbnail folder."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    old_id = body.get("old_session_id", "")
+    new_id = body.get("new_session_id", "")
+    
+    if not old_id or not new_id:
+        return web.json_response({"error": "old_session_id and new_session_id required"}, status=400)
+
+    safe_old = _safe_id(old_id)
+    safe_new = _safe_id(new_id)
+
+    if safe_old == safe_new:
+        return web.json_response({"status": "renamed"}) # Nothing to do
+        
+    old_json = os.path.join(SESSIONS_DIR, f"{safe_old}.json")
+    new_json = os.path.join(SESSIONS_DIR, f"{safe_new}.json")
+    
+    if os.path.exists(new_json):
+         return web.json_response({"error": f"Session '{new_id}' already exists."}, status=400)
+
+    # Rename JSON
+    if os.path.isfile(old_json):
+        try:
+            os.rename(old_json, new_json)
+        except OSError as e:
+            return web.json_response({"error": f"Could not rename file: {e}"}, status=500)
+    else:
+        # Create an empty session if it didn't exist before renaming
+        _save(new_id, {"run_count": 0, "entries": [], "feedback": {}})
+
+    # Rename images directory
+    old_dir = os.path.join(SESSIONS_DIR, safe_old)
+    new_dir = os.path.join(SESSIONS_DIR, safe_new)
+    
+    if os.path.isdir(old_dir):
+        try:
+            os.rename(old_dir, new_dir)
+        except OSError as e:
+            pass # Non-critical if it fails or doesn't exist
+
+    logger.info(f"[Session Feedback] Renamed session from '{old_id}' to '{new_id}'.")
+    return web.json_response({"status": "renamed"})
 
 
 @PromptServer.instance.routes.get("/session_feedback/thumbnails")
@@ -531,17 +706,16 @@ class SessionMemoryReaderNode:
 
     @classmethod
     def INPUT_TYPES(cls):
+        sessions = _get_available_sessions()
         return {
             "required": {
-                "session_id": ("STRING", {
-                    "default": "default",
-                    "tooltip": "Session identifier. Must match Writer/Feedback nodes.",
+                "existing_session": (["[CREATE NEW]"] + sessions, {
+                    "default": sessions[-1] if sessions else "[CREATE NEW]",
+                    "tooltip": "Select an existing session, or [CREATE NEW] to use the text box below."
                 }),
-            },
-            "optional": {
-                "reset_session": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Clear all memory, feedback, AND thumbnail images.",
+                "new_session_name": ("STRING", {
+                    "default": "new_session",
+                    "tooltip": "If [CREATE NEW] is selected above, this will be your new session_id."
                 }),
             },
         }
@@ -555,15 +729,14 @@ class SessionMemoryReaderNode:
     def IS_CHANGED(cls, **kwargs):
         return float("NaN")
 
-    def read(self, session_id: str = "default", reset_session: bool = False):
-        if reset_session:
-            _save(session_id, {"run_count": 0, "entries": [], "feedback": {}})
-            deleted = _delete_session_images(session_id)
-            logger.info(
-                f"[Session Memory Reader] Session '{session_id}' reset "
-                f"({deleted} thumbnail images removed)."
-            )
-            return ("", 0, session_id)
+    def read(self, existing_session="[CREATE NEW]", new_session_name="new_session"):
+        if existing_session == "[CREATE NEW]":
+            session_id = new_session_name.strip()
+        else:
+            session_id = existing_session
+
+        if not session_id:
+            session_id = "unnamed_session"
 
         session = _load(session_id)
         entries = session.get("entries", [])
@@ -670,14 +843,58 @@ class SessionMemoryWriterNode:
         return (run_summary, session_id)
 
 
+def _get_available_sessions():
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    sessions = []
+    for f in os.listdir(SESSIONS_DIR):
+        if f.endswith(".json"):
+            sessions.append(f[:-5])
+    return sorted(sessions) if sessions else ["default"]
+
+
+class SessionIDSelectorNode:
+    """
+    Select an existing session id from a list, or type a new one to start fresh.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        sessions = _get_available_sessions()
+        return {
+            "required": {
+                "existing_session": (["[CREATE NEW]"] + sessions, {
+                    "default": sessions[-1] if sessions else "[CREATE NEW]",
+                    "tooltip": "Select an existing session, or [CREATE NEW] to use the text box below."
+                }),
+                "new_session_name": ("STRING", {
+                    "default": "new_session",
+                    "tooltip": "If [CREATE NEW] is selected above, this will be your new session_id."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("session_id",)
+    FUNCTION = "select_id"
+    CATEGORY = "🧠 Memory"
+
+    def select_id(self, existing_session, new_session_name):
+        if existing_session == "[CREATE NEW]":
+            final_id = new_session_name.strip()
+        else:
+            final_id = existing_session
+        return (final_id,)
+
+
 # ── Registration ───────────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
+    "SessionIDSelector": SessionIDSelectorNode,
     "SessionFeedbackEditor": SessionFeedbackEditorNode,
     "SessionMemoryReader": SessionMemoryReaderNode,
     "SessionMemoryWriter": SessionMemoryWriterNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "SessionIDSelector": "🗑️ (DEPRECATED) Session ID Selector",
     "SessionFeedbackEditor": "\u2b50 Session Feedback Editor",
     "SessionMemoryReader": "\U0001f9e0 Session Memory Reader",
     "SessionMemoryWriter": "\U0001f4be Session Memory Writer",
