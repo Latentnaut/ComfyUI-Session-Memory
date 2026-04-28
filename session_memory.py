@@ -50,7 +50,18 @@ def _load(session_id: str) -> dict:
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            # Migrate legacy string entries to {prompt, summary} dicts
+            entries = data.get("entries", [])
+            migrated = False
+            for i, entry in enumerate(entries):
+                if isinstance(entry, str):
+                    entries[i] = {"prompt": entry, "summary": entry}
+                    migrated = True
+            if migrated:
+                data["entries"] = entries
+                logger.info(f"[Session Memory] Migrated {sum(1 for e in entries if isinstance(e, dict))} legacy entries in '{session_id}'.")
+            return data
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"[Session Memory] Could not read {path}: {e}")
     return {"run_count": 0, "entries": [], "feedback": {}}
@@ -66,12 +77,31 @@ def _save(session_id: str, data: dict) -> None:
 
 
 def _parse_prompts_from_entry(entry_text: str) -> list[dict]:
-    """Extract prompt headers, concepts, and full text from a run entry string."""
+    """Extract prompt headers, concepts, and full text from a run entry string.
+
+    Supports three formats (tried in order):
+    1. XML-style ``<prompt>text</prompt>`` blocks (Visual DNA Synthesizer)
+    2. Legacy ``PROMPT N:`` markers
+    3. Fallback: whole entry treated as a single Prompt 1
+    """
     prompts = []
+
+    # ── Strategy 1: XML-style <prompt> tags ──────────────────────────
+    xml_blocks = re.findall(r'<prompt>\s*(.*?)\s*</prompt>', entry_text, re.DOTALL)
+    if xml_blocks:
+        for i, block in enumerate(xml_blocks, start=1):
+            prompts.append({
+                "number": i,
+                "concept": f"Prompt {i}",
+                "fullText": block.strip(),
+            })
+        return prompts
+
+    # ── Strategy 2: PROMPT N: markers ────────────────────────────────
     prompt_blocks = re.split(r'(?=PROMPT \d+:)', entry_text)
     # Markers that indicate the start of a trailing summary section (not prompt content)
     _SUMMARY_MARKERS = re.compile(
-        r'^(SESSION\s+TALLY|TALLY|SUMMARY|SESSION_FEEDBACK|RUN\s+\d+)', re.MULTILINE
+        r'^(SESSION\s+TALLY|TALLY|SUMMARY|SESSION_FEEDBACK|RUN\s+\d+:)', re.MULTILINE
     )
     for block in prompt_blocks:
         m = re.match(r'PROMPT (\d+):', block)
@@ -91,20 +121,23 @@ def _parse_prompts_from_entry(entry_text: str) -> list[dict]:
                 "concept": concept,
                 "fullText": full_text,
             })
-            
-    # Fallback: if no PROMPT X markers, treat the whole entry as Prompt 1
-    if not prompts and entry_text.strip():
+
+    if prompts:
+        return prompts
+
+    # ── Fallback: whole entry as Prompt 1 ────────────────────────────
+    if entry_text.strip():
         full_text = entry_text.strip()
         trail = _SUMMARY_MARKERS.search(full_text)
         if trail:
             full_text = full_text[:trail.start()]
-        
+
         prompts.append({
             "number": 1,
             "concept": "Result",
             "fullText": full_text.strip()
         })
-        
+
     return prompts
 
 
@@ -123,8 +156,18 @@ def _save_thumbnails(session_id, run_number, num_prompts, batch_count,
     Layout: sessions/{sid}/run_{N}/prompt_{P}/img_{K}.jpg
     where K is the batch/pass index (0-based).
 
-    Image order in tensor: [pass0_p1, pass0_p2, ..., pass1_p1, pass1_p2, ...]
-    Total images = num_prompts × batch_count.
+    Image order in tensor: [p1, p2, ..., pN, p1, p2, ..., pN, ...]
+    distributed round-robin across prompts.
+
+    With ``batch_count > 1`` ComfyUI **re-executes the entire graph** for
+    each batch pass, sending the *full* image tensor every time.  We must
+    avoid saving duplicate images.  Strategy:
+
+    * On the **first call** (prompt dirs are empty) → save all images.
+    * On **subsequent calls** (prompt dirs already populated) → compute
+      how many images *per prompt* this call would add.  If the folder
+      already holds ``>= expected_per_prompt`` images, skip entirely
+      (the images are duplicates from a graph re-execution).
     """
     import numpy as np
     from PIL import Image as PILImage
@@ -132,17 +175,36 @@ def _save_thumbnails(session_id, run_number, num_prompts, batch_count,
     base_dir = _session_images_dir(session_id)
     run_dir = os.path.join(base_dir, f"run_{run_number}")
 
-    # NOTE: Do NOT rmtree run_dir here. ComfyUI with batch_count>1
-    # re-executes the whole graph for each batch. Batch 1 saves img_0,
-    # then batch 2 arrives and must APPEND img_1, not destroy img_0.
-
     B = images_tensor.shape[0]
-    saved = 0
 
     logger.info(
         f"[Session Feedback] Saving thumbnails: B={B}, "
         f"num_prompts={num_prompts}, batch_count_widget={batch_count}"
     )
+
+    # The user-specified batch_count is the authoritative expected number
+    # of images per prompt.  Use it as the dedup threshold:
+    #   - Combined tensor (B = num_prompts × batch_count): first call saves
+    #     everything correctly; subsequent re-executions are skipped.
+    #   - Partial batches (B = num_prompts per call): each call appends
+    #     until batch_count is reached, then subsequent calls are skipped.
+    expected_per_prompt = max(1, batch_count)
+
+    first_prompt_dir = os.path.join(run_dir, "prompt_1")
+    if os.path.isdir(first_prompt_dir):
+        existing_count = len([
+            f for f in os.listdir(first_prompt_dir)
+            if f.startswith("img_") and f.endswith(".jpg")
+        ])
+        if existing_count >= expected_per_prompt:
+            logger.info(
+                f"[Session Feedback] Prompt_1 already has {existing_count} "
+                f"images (>= {expected_per_prompt} expected per batch_count). "
+                f"Skipping duplicate re-execution."
+            )
+            return
+
+    saved = 0
 
     # Distribute images round-robin: image[i] → prompt (i % num_prompts)
     for i in range(B):
@@ -258,7 +320,10 @@ def _format_feedback_block(feedback: dict) -> str:
 
 @PromptServer.instance.routes.get("/session_feedback/load")
 async def _api_load_feedback(request):
-    """Load run data + existing feedback for the frontend editor."""
+    """Load run data + existing feedback for the frontend editor.
+
+    The feedback editor shows the PROMPT text (not the summary).
+    """
     session_id = request.query.get("session_id", "default")
     run_number = request.query.get("run_number", "")
 
@@ -284,7 +349,12 @@ async def _api_load_feedback(request):
     sel_run = max(1, min(sel_run, run_count))
 
     idx = sel_run - 1
-    entry_text = entries[idx] if idx < len(entries) else ""
+    entry = entries[idx] if idx < len(entries) else {}
+    # Use the prompt field for display in the feedback editor
+    if isinstance(entry, dict):
+        entry_text = entry.get("prompt", "")
+    else:
+        entry_text = entry  # legacy string fallback
     prompts = _parse_prompts_from_entry(entry_text)
     run_feedback = feedback.get(str(sel_run), {}).get("prompts", {})
 
@@ -393,7 +463,22 @@ async def _api_delete_run(request):
     # 1. Update entries
     if 0 <= idx < len(entries):
         entries.pop(idx)
+    
     session["run_count"] = max(0, run_count - 1)
+    
+    # Renumber the headers inside the entries to maintain 1..N contiguity
+    for i in range(len(entries)):
+        if isinstance(entries[i], dict):
+            for field in ("prompt", "summary"):
+                if field in entries[i]:
+                    entries[i][field] = re.sub(
+                        r'^---\s*RUN\s+\d+\s*---\n',
+                        f'--- RUN {i+1} ---\n',
+                        entries[i][field], count=1, flags=re.MULTILINE,
+                    )
+        else:
+            entries[i] = re.sub(r'^---\s*RUN\s+\d+\s*---\n', f'--- RUN {i+1} ---\n', entries[i], count=1, flags=re.MULTILINE)
+        
     session["entries"] = entries
 
     # 2. Update feedback keys
@@ -646,9 +731,14 @@ class SessionFeedbackEditorNode:
             )
 
         # Get latest run prompts + existing feedback
+        # Feedback editor shows the PROMPT text (not summary)
         entries = session.get("entries", [])
-        latest_entry = entries[-1] if entries else ""
-        prompts = _parse_prompts_from_entry(latest_entry)
+        latest_entry = entries[-1] if entries else {}
+        if isinstance(latest_entry, dict):
+            entry_text = latest_entry.get("prompt", "")
+        else:
+            entry_text = latest_entry  # legacy string fallback
+        prompts = _parse_prompts_from_entry(entry_text)
         feedback = session.get("feedback", {})
         run_feedback = feedback.get(str(run_count), {}).get("prompts", {})
 
@@ -743,7 +833,28 @@ class SessionMemoryReaderNode:
         run_count = session.get("run_count", 0)
         feedback = session.get("feedback", {})
 
-        session_memory = "\n".join(entries) if entries else ""
+        # Reader returns the SUMMARY field (not the prompt).
+        # When summary is empty / placeholder, try extracting <summary>
+        # tags from the prompt field (Visual DNA Synthesizer format).
+        _PLACEHOLDER = "(No summary provided for this run)"
+        summaries = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                summary_text = entry.get("summary", "")
+                # Detect placeholder / empty summary → extract <summary> tags
+                stripped = summary_text.strip().lstrip("- RUN 0123456789\n")
+                if not stripped or stripped == _PLACEHOLDER:
+                    prompt_text = entry.get("prompt", "")
+                    xml_sums = re.findall(
+                        r'<summary>\s*(.*?)\s*</summary>',
+                        prompt_text, re.DOTALL,
+                    )
+                    if xml_sums:
+                        summary_text = "\n".join(s.strip() for s in xml_sums)
+                summaries.append(summary_text)
+            else:
+                summaries.append(entry)  # legacy string fallback
+        session_memory = "\n".join(summaries) if summaries else ""
 
         # Append feedback block if any
         feedback_block = _format_feedback_block(feedback)
@@ -776,10 +887,15 @@ class SessionMemoryWriterNode:
                     "default": "default",
                     "tooltip": "Session identifier. Must match Reader/Feedback.",
                 }),
-                "run_summary": ("STRING", {
+                "prompt": ("STRING", {
                     "multiline": True,
                     "default": "",
-                    "tooltip": "Structured summary from the Gemini Summarizer.",
+                    "tooltip": "The raw prompt sent to the model. Displayed in the Feedback Editor.",
+                }),
+                "summary": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "tooltip": "Structured summary from the Gemini Summarizer. Returned by the Reader.",
                 }),
             },
             "optional": {
@@ -800,26 +916,37 @@ class SessionMemoryWriterNode:
     FUNCTION = "write"
     CATEGORY = "\U0001f9e0 Memory"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
     def write(
         self,
         session_id: str = "default",
-        run_summary: str = "",
+        prompt: str = "",
+        summary: str = "",
         max_runs: int = 0,
     ):
-        stripped = run_summary.strip()
-        if not stripped:
+        prompt_stripped = prompt.strip()
+        summary_stripped = summary.strip()
+
+        if not prompt_stripped:
+            prompt_stripped = "(No prompt provided for this run)"
+        if not summary_stripped:
+            summary_stripped = "(No summary provided for this run)"
             logger.info(
-                f"[Session Memory Writer] Empty summary — nothing written "
-                f"to session '{session_id}'."
+                f"[Session Memory Writer] Empty summary — creating a new run with placeholder in session '{session_id}'."
             )
-            return (run_summary, session_id)
 
         session = _load(session_id)
         run_count = session.get("run_count", 0) + 1
-        entries: list[str] = session.get("entries", [])
+        entries: list = session.get("entries", [])
         feedback = session.get("feedback", {})
 
-        entry = f"--- RUN {run_count} ---\n{stripped}\n"
+        entry = {
+            "prompt": f"--- RUN {run_count} ---\n{prompt_stripped}\n",
+            "summary": f"--- RUN {run_count} ---\n{summary_stripped}\n",
+        }
         entries.append(entry)
 
         # Sliding window
@@ -838,9 +965,10 @@ class SessionMemoryWriterNode:
         })
         logger.info(
             f"[Session Memory Writer] Written Run {run_count} to session "
-            f"'{session_id}' ({len(stripped)} chars, {len(entries)} entries)."
+            f"'{session_id}' (prompt={len(prompt_stripped)} chars, "
+            f"summary={len(summary_stripped)} chars, {len(entries)} entries)."
         )
-        return (run_summary, session_id)
+        return (summary, session_id)
 
 
 def _get_available_sessions():

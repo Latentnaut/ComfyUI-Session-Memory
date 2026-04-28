@@ -2,15 +2,15 @@
 
 > Structured workflow memory and human-in-the-loop creative feedback for ComfyUI.
 
-ComfyUI-Session-Memory gives your generation workflows **persistent memory across runs**. It accumulates structured run summaries, injects them into your LLM system prompt for context-aware generation, and provides an interactive in-node feedback panel where you can rate and annotate every prompt — all without leaving ComfyUI.
+ComfyUI-Session-Memory gives your generation workflows **persistent memory across runs**. It stores both the raw prompts and structured summaries, injects summaries into your LLM system prompt for context-aware generation, and provides an interactive in-node feedback panel where you can rate and annotate every prompt — all without leaving ComfyUI.
 
 ---
 
 ## ✨ Features
 
-- **Session Memory Reader** — Loads the full accumulated history of a session and outputs it as a string ready to inject into any LLM system prompt.
-- **Session Memory Writer** — Receives a structured run summary and appends it to the session's persistent JSON file. Outputs the current `run_count` for downstream nodes.
-- **Session Feedback Editor** — Interactive in-node UI to rate (⭐ 1–5) and annotate each prompt after every run. Supports visual thumbnail previews of generated images, organized per prompt and per batch pass.
+- **Session Memory Reader** — Loads the accumulated session history and outputs the **summaries** for injection into any LLM system prompt.
+- **Session Memory Writer** — Receives both the **raw prompt** and a **structured summary**, storing them as paired entries in the session's persistent JSON file.
+- **Session Feedback Editor** — Interactive in-node UI to rate (⭐ 1–5) and annotate each prompt. Displays the **raw prompt text** (not the summary) for accurate creative review. Supports visual thumbnail previews of generated images.
 - **Feedback injection** — Rated prompts are automatically converted into `REPLICATE` / `AVOID` directives injected into the next run's system prompt, closing the creative feedback loop.
 - **Thumbnail system** — Accepts a full image batch, downscales to ≤1 MP, and saves them organized as `sessions/{id}/run_{N}/prompt_{P}/img_{K}.jpg`. Supports multi-pass batches (`batch_count > 1`).
 
@@ -28,7 +28,9 @@ ComfyUI-Session-Memory gives your generation workflows **persistent memory acros
     └────────────── sessions/{session_id}.json ◄────────┘
 ```
 
-The **Reader** always emits the history *before* the current run begins. The **Writer** appends the new summary *after* the run completes. The **Feedback Editor** operates non-destructively in parallel — it never blocks the Reader's next read until you explicitly save feedback.
+The **Reader** emits the accumulated **summaries** before the current run begins.
+The **Writer** stores both the **prompt** and **summary** after the run completes.
+The **Feedback Editor** displays the **prompt** text for review — it never shows the summary.
 
 ---
 
@@ -54,16 +56,18 @@ Loads and outputs the full accumulated session log.
 
 ### 💾 Session Memory Writer
 
-Appends a new run summary to the session file.
+Stores both the raw prompt and a structured summary as a paired entry.
 
 | Input | Type | Description |
 |---|---|---|
 | `session_id` | `STRING` | Session identifier |
-| `run_summary` | `STRING` | Structured text summary from a Gemini/LLM summarizer node |
+| `prompt` | `STRING` | The raw prompt sent to the model. **Displayed** in the Feedback Editor |
+| `summary` | `STRING` | Structured summary from a Gemini/LLM summarizer. **Returned** by the Reader |
+| `max_runs` | `INT` | Sliding window: keep only the last N runs (0 = unlimited) |
 
 | Output | Type | Description |
 |---|---|---|
-| `run_count` | `INT` | Current run number after writing |
+| `run_summary` | `STRING` | Pass-through of the summary |
 | `session_id` | `STRING` | Pass-through for chaining to Feedback Editor |
 
 ---
@@ -152,8 +156,10 @@ Search for `Session Memory` in the ComfyUI Manager and install.
 {
   "run_count": 5,
   "entries": [
-    "RUN 1:\nPROMPT 1: concept: urban decay...",
-    "..."
+    {
+      "prompt": "--- RUN 1 ---\nPROMPT 1: concept: urban decay...\n",
+      "summary": "--- RUN 1 ---\nSummary of urban decay concept...\n"
+    }
   ],
   "feedback": {
     "3": {
@@ -165,6 +171,8 @@ Search for `Session Memory` in the ComfyUI Manager and install.
   }
 }
 ```
+
+> **Backwards compatibility:** Legacy sessions with plain-string entries are automatically migrated on load. Each old string becomes both the `prompt` and `summary`.
 
 ---
 
